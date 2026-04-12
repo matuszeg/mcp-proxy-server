@@ -42,11 +42,46 @@ const publicPath = path.join(__dirname, '..', 'public');
 const sseTransports = new Map<string, SSEServerTransport>();
 const streamableHttpTransports = new Map<string, StreamableHTTPServerTransport>();
 
-// createServer no longer returns connectedClients
-const { server, cleanup } = await createServer();
+// Per-session server instances to avoid "Already connected to a transport" errors.
+// Each incoming connection gets its own Server/Protocol instance while sharing backend state.
+import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
+interface ManagedSession {
+  server: InstanceType<typeof McpServer>;
+  lastActivity: number;
+}
+const activeSessions = new Map<string, ManagedSession>();
 
-// No longer creating a single mainHttpTransport at startup for /mcp.
-// Transports for /mcp will be created dynamically per session.
+const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
+
+// Sweep idle sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, session] of activeSessions.entries()) {
+    if (now - session.lastActivity > SESSION_IDLE_TIMEOUT_MS) {
+      logger.log(`Session ${sessionId} idle for >30 minutes, cleaning up.`);
+      session.server.close().catch((e: any) => logger.warn(`Error closing idle session ${sessionId}:`, e));
+      activeSessions.delete(sessionId);
+      // Also clean up transports
+      if (sseTransports.has(sessionId)) {
+        const transport = sseTransports.get(sessionId)!;
+        transport.close?.().catch(() => {});
+        sseTransports.delete(sessionId);
+      }
+      if (streamableHttpTransports.has(sessionId)) {
+        const transport = streamableHttpTransports.get(sessionId)!;
+        transport.close?.().catch(() => {});
+        streamableHttpTransports.delete(sessionId);
+      }
+    }
+  }
+  if (activeSessions.size > 0) {
+    logger.log(`Session cleanup sweep: ${activeSessions.size} active session(s) remaining.`);
+  }
+}, SESSION_CLEANUP_INTERVAL_MS);
+
+// createServer initializes backend connections and returns a factory for per-session Server instances
+const { cleanup, createServerInstance } = await createServer();
 
 const allowedKeysRaw = process.env.ALLOWED_KEYS || "";
 const allowedKeys = new Set(allowedKeysRaw.split(',').map(k => k.trim()).filter(k => k.length > 0));
@@ -613,23 +648,31 @@ app.get("/sse", async (req, res) => {
 
     currentTransport.onerror = (err: any) => {
       logger.error(`[${clientId}] SSE transport error for session ${currentSessionId}: ${err?.stack || err?.message || err}`);
-      if (sseTransports.has(currentSessionId)) {
-        sseTransports.delete(currentSessionId);
-        logger.log(`[${clientId}] Transport for session ${currentSessionId} removed due to error. Active sessions: ${sseTransports.size}`);
+      sseTransports.delete(currentSessionId);
+      const session = activeSessions.get(currentSessionId);
+      if (session) {
+        session.server.close().catch(() => {});
+        activeSessions.delete(currentSessionId);
       }
+      logger.log(`[${clientId}] Session ${currentSessionId} removed due to error. Active sessions: ${activeSessions.size}`);
     };
 
     currentTransport.onclose = () => {
       logger.log(`[${clientId}] SSE client disconnected for session ${currentSessionId}.`);
-      if (sseTransports.has(currentSessionId)) {
-        sseTransports.delete(currentSessionId);
-        logger.log(`[${clientId}] Transport for session ${currentSessionId} removed on close. Active sessions: ${sseTransports.size}`);
+      sseTransports.delete(currentSessionId);
+      const session = activeSessions.get(currentSessionId);
+      if (session) {
+        session.server.close().catch(() => {});
+        activeSessions.delete(currentSessionId);
       }
+      logger.log(`[${clientId}] Session ${currentSessionId} removed on close. Active sessions: ${activeSessions.size}`);
     };
 
-    logger.log(`[${clientId}] Attempting server.connect for new transport with session ${currentSessionId}...`);
-    await server.connect(currentTransport);
-    logger.log(`[${clientId}] SSE client connected successfully via server.connect for session ${currentSessionId}.`);
+    logger.log(`[${clientId}] Creating new server instance and connecting transport for session ${currentSessionId}...`);
+    const sessionServer = createServerInstance();
+    await sessionServer.connect(currentTransport);
+    activeSessions.set(currentSessionId, { server: sessionServer, lastActivity: Date.now() });
+    logger.log(`[${clientId}] SSE client connected successfully for session ${currentSessionId}. Active sessions: ${activeSessions.size}`);
 
   } catch (error: any) {
     const logSessionIdOnError = actualTransportSessionId || sessionIdFromClientQuery || "unknown_during_error_handling";
@@ -706,6 +749,11 @@ app.all("/mcp", async (req, res) => { // Changed to app.all to handle GET for SS
       return;
     }
     logger.log(`[${clientId}] /mcp: Using existing transport for Mcp-Session-Id: ${clientProvidedSessionId}`);
+    // Update last activity for session idle tracking
+    const existingSession = activeSessions.get(clientProvidedSessionId);
+    if (existingSession) {
+      existingSession.lastActivity = Date.now();
+    }
   } else {
     // No Mcp-Session-Id from client, or it's an InitializeRequest that might not have one yet.
     // Create a new transport. The transport itself will generate a session ID.
@@ -731,6 +779,12 @@ app.all("/mcp", async (req, res) => { // Changed to app.all to handle GET for SS
                     if (transportInstanceFromMap === capturedHttpTransportInstance) {
                         streamableHttpTransports.delete(tempGeneratedIdForEarlyMap);
                         streamableHttpTransports.set(finalSessionId, capturedHttpTransportInstance);
+                        // Remap the managed session from temp ID to final ID
+                        const managedSession = activeSessions.get(tempGeneratedIdForEarlyMap);
+                        if (managedSession) {
+                            activeSessions.delete(tempGeneratedIdForEarlyMap);
+                            activeSessions.set(finalSessionId, managedSession);
+                        }
                         if (transportSessionIdToUse === tempGeneratedIdForEarlyMap) {
                             transportSessionIdToUse = finalSessionId;
                         }
@@ -768,17 +822,23 @@ app.all("/mcp", async (req, res) => { // Changed to app.all to handle GET for SS
     const currentTransportForHandlers = httpTransport; // Use this specific instance in handlers
 
     currentTransportForHandlers.onerror = (error: Error) => {
-      // Use currentTransportForHandlers.sessionId if available, otherwise fallback to transportSessionIdToUse (which might be temp or final)
       const idToClean = currentTransportForHandlers.sessionId || transportSessionIdToUse;
       logger.error(`[${clientId}] /mcp: StreamableHTTPServerTransport error for session related to ${idToClean}:`, error);
-      
+
       if (streamableHttpTransports.get(tempGeneratedIdForEarlyMap) === currentTransportForHandlers) {
         streamableHttpTransports.delete(tempGeneratedIdForEarlyMap);
       }
       if (currentTransportForHandlers.sessionId && streamableHttpTransports.get(currentTransportForHandlers.sessionId) === currentTransportForHandlers) {
         streamableHttpTransports.delete(currentTransportForHandlers.sessionId);
       }
-      logger.log(`[${clientId}] /mcp: Transport for session related to ${idToClean} removed due to error. Active: ${streamableHttpTransports.size}`);
+      // Clean up managed session
+      for (const id of [tempGeneratedIdForEarlyMap, currentTransportForHandlers.sessionId]) {
+        if (id && activeSessions.has(id)) {
+          activeSessions.get(id)!.server.close().catch(() => {});
+          activeSessions.delete(id);
+        }
+      }
+      logger.log(`[${clientId}] /mcp: Session ${idToClean} removed due to error. Active sessions: ${activeSessions.size}`);
     };
 
     currentTransportForHandlers.onclose = () => {
@@ -790,14 +850,24 @@ app.all("/mcp", async (req, res) => { // Changed to app.all to handle GET for SS
       if (currentTransportForHandlers.sessionId && streamableHttpTransports.get(currentTransportForHandlers.sessionId) === currentTransportForHandlers) {
         streamableHttpTransports.delete(currentTransportForHandlers.sessionId);
       }
-      logger.log(`[${clientId}] /mcp: Transport for session related to ${idToClean} removed on close. Active: ${streamableHttpTransports.size}`);
+      // Clean up managed session
+      for (const id of [tempGeneratedIdForEarlyMap, currentTransportForHandlers.sessionId]) {
+        if (id && activeSessions.has(id)) {
+          activeSessions.get(id)!.server.close().catch(() => {});
+          activeSessions.delete(id);
+        }
+      }
+      logger.log(`[${clientId}] /mcp: Session ${idToClean} removed on close. Active sessions: ${activeSessions.size}`);
     };
 
     try {
-      await server.connect(currentTransportForHandlers);
-      logger.log(`[${clientId}] /mcp: New transport (temp ID: ${transportSessionIdToUse}, awaiting final SDK sessionId) connected to server.`);
+      const sessionServer = createServerInstance();
+      await sessionServer.connect(currentTransportForHandlers);
+      // Store with temp ID; will be remapped in onsessioninitialized
+      activeSessions.set(tempGeneratedIdForEarlyMap, { server: sessionServer, lastActivity: Date.now() });
+      logger.log(`[${clientId}] /mcp: New transport (temp ID: ${transportSessionIdToUse}, awaiting final SDK sessionId) connected. Active sessions: ${activeSessions.size}`);
     } catch (connectError: any) {
-      logger.error(`[${clientId}] /mcp: Failed to connect new transport to server:`, connectError);
+      logger.error(`[${clientId}] /mcp: Failed to connect new transport:`, connectError);
       streamableHttpTransports.delete(tempGeneratedIdForEarlyMap); // Clean up temp entry
       if (!res.headersSent) {
         res.status(500).json({
@@ -899,9 +969,12 @@ expressServer.listen(PORT, () => {
 const shutdown = async (signal: string) => {
   logger.log(`\nReceived ${signal}. Shutting down gracefully...`);
   try {
-    logger.log("Closing MCP Server (disconnecting transports)...");
-    await server.close();
-    logger.log("MCP Server closed.");
+    logger.log(`Closing ${activeSessions.size} active session server(s)...`);
+    for (const [sessionId, session] of activeSessions.entries()) {
+      await session.server.close().catch((e: any) => logger.warn(`Error closing session ${sessionId}:`, e));
+    }
+    activeSessions.clear();
+    logger.log("All session servers closed.");
 
     logger.log("Cleaning up backend clients...");
     await cleanup();

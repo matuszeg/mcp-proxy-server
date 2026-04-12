@@ -6,7 +6,8 @@ import { createServer } from "./mcp-proxy.js";
 
 async function main() {
   const transport = new StdioServerTransport();
-  const { server, cleanup } = await createServer();
+  const { cleanup, createServerInstance } = await createServer();
+  const server = createServerInstance();
 
   await server.connect(transport);
 

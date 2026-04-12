@@ -400,11 +400,33 @@ export const createServer = async () => {
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms)); // Define sleep
 
-  // Create the main proxy server instance
+  // Cleanup function needs to handle the *current* list of clients
+  const cleanup = async () => {
+    logger.log(`Cleaning up ${currentConnectedClients.length} connected clients...`);
+    await Promise.all(currentConnectedClients.map(async ({ name, cleanup: clientCleanup }) => {
+        try {
+            await clientCleanup();
+             logger.log(`  Cleaned up client: ${name}`);
+        } catch(error: any) {
+             logger.error(`  Error cleaning up client ${name}: ${error.message}`);
+        }
+    }));
+    currentConnectedClients = []; // Clear the list after cleanup
+  };
+
+  // Return the cleanup function and a factory to create per-session server instances
+  return { cleanup, createServerInstance: () => createServerInstance(sleep) };
+};
+
+// --- Per-Session Server Instance Factory ---
+// Creates a new Server instance with all request handlers registered.
+// Each instance shares the module-level backend connection state (toolToClientMap, etc.)
+// but has its own Protocol, allowing independent transport connections.
+function createServerInstance(sleep: (ms: number) => Promise<unknown>) {
   const server = new Server(
     {
       name: "mcp_proxy_server",
-      version: "1.0.0", // Consider updating version dynamically
+      version: "1.0.0",
     },
     {
       capabilities: {
@@ -416,8 +438,7 @@ export const createServer = async () => {
   );
 
   // --- Request Handlers ---
-  // These handlers now rely on the maps populated by updateBackendConnections
-  // Note: InitializeRequest is handled by the SDK's Server default behavior.
+  // These handlers rely on the shared maps populated by updateBackendConnections
 
   server.setRequestHandler(ListToolsRequestSchema, async (request) => {
     logger.log("Received tools/list request - applying overrides from config");
@@ -732,21 +753,5 @@ export const createServer = async () => {
     };
   });
 
-  // Cleanup function needs to handle the *current* list of clients
-  const cleanup = async () => {
-    logger.log(`Cleaning up ${currentConnectedClients.length} connected clients...`);
-    await Promise.all(currentConnectedClients.map(async ({ name, cleanup: clientCleanup }) => {
-        try {
-            await clientCleanup();
-             logger.log(`  Cleaned up client: ${name}`);
-        } catch(error: any) {
-             logger.error(`  Error cleaning up client ${name}: ${error.message}`);
-        }
-    }));
-    currentConnectedClients = []; // Clear the list after cleanup
-  };
-
-  // Return the server instance and the cleanup function
-  // We don't return connectedClients anymore as it's managed internally
-  return { server, cleanup };
-};
+  return server;
+}
