@@ -22,7 +22,6 @@ import {
 import { createClients, ConnectedClient, reconnectSingleClient } from './client.js';
 import { logger } from './logger.js';
 import { Config, loadConfig, TransportConfig, isSSEConfig, isStdioConfig, isHttpConfig, ToolConfig, loadToolConfig, DEFAULT_SERVER_TOOLNAME_SEPERATOR } from './config.js';
-import { z } from 'zod';
 import * as eventsource from 'eventsource';
 
 global.EventSource = eventsource.EventSource;
@@ -595,13 +594,12 @@ export const createServer = async () => {
   server.setRequestHandler(ListPromptsRequestSchema, async (request) => {
     logger.log("Received prompts/list request - returning from cached map");
     // Directly use the pre-populated map
-    const allPrompts: z.infer<typeof ListPromptsResultSchema>['prompts'] = [];
+    const allPrompts: Array<{ name: string; description?: string }> = [];
      for (const [name, connectedClient] of promptToClientMap.entries()) {
          // Similar simplification as tools/list
          allPrompts.push({
              name: name, // The map key is the original name
              description: `[${connectedClient.name}] Prompt (details omitted in list)`,
-             inputSchema: {},
          });
         }
        logger.log(`Returning ${allPrompts.length} prompts from map.`);
@@ -613,14 +611,13 @@ export const createServer = async () => {
 
    server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
        logger.log("Received resources/list request - returning from cached map");
-       const allResources: z.infer<typeof ListResourcesResultSchema>['resources'] = [];
+       const allResources: Array<{ uri: string; name: string; description?: string }> = [];
        for (const [uri, connectedClient] of resourceToClientMap.entries()) {
            // Simplified response
            allResources.push({
                uri: uri,
                name: `[${connectedClient.name}] Resource (details omitted in list)`,
                description: undefined,
-               methods: [], // Cannot know methods without asking client
            });
        }
        logger.log(`Returning ${allResources.length} resources from map.`);

@@ -114,9 +114,6 @@ const createClient = (name: string, transportConfig: TransportConfig): { client:
      version: '1.0.0',
    }, {
      capabilities: {
-       prompts: {},
-       resources: { subscribe: true },
-       tools: {}
      }
    });
 
@@ -272,7 +269,7 @@ export async function reconnectSingleClient(
     name: 'mcp-proxy-client-reconnect',
     version: '1.0.1',
   }, {
-    capabilities: { prompts: {}, resources: { subscribe: true }, tools: {} }
+    capabilities: {}
   });
 
   try {
