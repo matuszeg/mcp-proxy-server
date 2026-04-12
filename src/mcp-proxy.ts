@@ -8,9 +8,6 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
   Tool,
-  ListToolsResultSchema,
-  ListPromptsResultSchema,
-  ListResourcesResultSchema,
   ReadResourceResultSchema,
   ListResourceTemplatesRequestSchema,
   ListResourceTemplatesResultSchema,
@@ -22,7 +19,37 @@ import {
 import { createClients, ConnectedClient, reconnectSingleClient } from './client.js';
 import { logger } from './logger.js';
 import { Config, loadConfig, TransportConfig, isSSEConfig, isStdioConfig, isHttpConfig, ToolConfig, loadToolConfig, DEFAULT_SERVER_TOOLNAME_SEPERATOR } from './config.js';
+import { z } from 'zod';
 import * as eventsource from 'eventsource';
+
+// Permissive result schemas using zod v3 to avoid zod v4 _zod property crashes
+// when parsing responses from servers using different SDK versions.
+// The SDK's built-in schemas (e.g. ListToolsResultSchema) use zod v4 internally
+// and can crash with "Cannot read properties of undefined (reading '_zod')" on
+// tool definitions that use plain JSON Schema objects without zod metadata.
+const PermissiveListToolsResult = z.object({
+  tools: z.array(z.object({
+    name: z.string(),
+    description: z.string().optional(),
+    inputSchema: z.any().optional(),
+  }).passthrough()),
+}).passthrough();
+
+const PermissiveListPromptsResult = z.object({
+  prompts: z.array(z.object({
+    name: z.string(),
+    description: z.string().optional(),
+  }).passthrough()),
+}).passthrough();
+
+const PermissiveListResourcesResult = z.object({
+  resources: z.array(z.object({
+    uri: z.string(),
+    name: z.string(),
+    description: z.string().optional(),
+    mimeType: z.string().optional(),
+  }).passthrough()),
+}).passthrough();
 
 global.EventSource = eventsource.EventSource;
 
@@ -125,7 +152,7 @@ export const updateBackendConnections = async (newServerConfig: Config, newToolC
     // Repopulate Tools Map
     for (const connectedClient of currentConnectedClients) {
         try {
-            const result = await connectedClient.client.request({ method: 'tools/list', params: {} }, ListToolsResultSchema);
+            const result = await connectedClient.client.request({ method: 'tools/list', params: {} }, PermissiveListToolsResult as any);
             if (result.tools && result.tools.length > 0) {
                 for (const tool of result.tools) {
                     const qualifiedName = `${connectedClient.name}${currentSeparator}${tool.name}`; // Use the current separator
@@ -148,9 +175,9 @@ export const updateBackendConnections = async (newServerConfig: Config, newToolC
     // Repopulate Resources Map
     for (const connectedClient of currentConnectedClients) {
          try {
-             const result = await connectedClient.client.request({ method: 'resources/list', params: {} }, ListResourcesResultSchema);
+             const result = await connectedClient.client.request({ method: 'resources/list', params: {} }, PermissiveListResourcesResult as any);
              if (result.resources) {
-                 result.resources.forEach(resource => resourceToClientMap.set(resource.uri, connectedClient));
+                 result.resources.forEach((resource: any) => resourceToClientMap.set(resource.uri, connectedClient));
              }
          } catch (error: any) {
               if (!(error?.name === 'McpError' && error?.code === -32601)) { // Ignore 'Method not found'
@@ -163,9 +190,9 @@ export const updateBackendConnections = async (newServerConfig: Config, newToolC
     // Repopulate Prompts Map
     for (const connectedClient of currentConnectedClients) {
          try {
-             const result = await connectedClient.client.request({ method: 'prompts/list', params: {} }, ListPromptsResultSchema);
+             const result = await connectedClient.client.request({ method: 'prompts/list', params: {} }, PermissiveListPromptsResult as any);
              if (result.prompts) {
-                 result.prompts.forEach(prompt => promptToClientMap.set(prompt.name, connectedClient));
+                 result.prompts.forEach((prompt: any) => promptToClientMap.set(prompt.name, connectedClient));
              }
          } catch (error: any) {
               if (!(error?.name === 'McpError' && error?.code === -32601)) { // Ignore 'Method not found'
@@ -240,7 +267,7 @@ async function refreshBackendConnection(serverKey: string, serverConfig: Transpo
     // Repopulate maps for the reconnected client
     const connectedClient = newConnectedClientEntry;
     try {
-        const result = await connectedClient.client.request({ method: 'tools/list', params: {} }, ListToolsResultSchema);
+        const result = await connectedClient.client.request({ method: 'tools/list', params: {} }, PermissiveListToolsResult as any);
         if (result.tools && result.tools.length > 0) {
             for (const tool of result.tools) {
                 const qualifiedName = `${connectedClient.name}${currentSeparator}${tool.name}`; // Use the current separator
@@ -258,9 +285,9 @@ async function refreshBackendConnection(serverKey: string, serverConfig: Transpo
     }
 
     try {
-         const result = await connectedClient.client.request({ method: 'resources/list', params: {} }, ListResourcesResultSchema);
+         const result = await connectedClient.client.request({ method: 'resources/list', params: {} }, PermissiveListResourcesResult as any);
          if (result.resources) {
-             result.resources.forEach(resource => resourceToClientMap.set(resource.uri, connectedClient));
+             result.resources.forEach((resource: any) => resourceToClientMap.set(resource.uri, connectedClient));
          }
      } catch (error: any) {
           if (!(error?.name === 'McpError' && error?.code === -32601)) {
@@ -269,9 +296,9 @@ async function refreshBackendConnection(serverKey: string, serverConfig: Transpo
      }
 
     try {
-         const result = await connectedClient.client.request({ method: 'prompts/list', params: {} }, ListPromptsResultSchema);
+         const result = await connectedClient.client.request({ method: 'prompts/list', params: {} }, PermissiveListPromptsResult as any);
          if (result.prompts) {
-             result.prompts.forEach(prompt => promptToClientMap.set(prompt.name, connectedClient));
+             result.prompts.forEach((prompt: any) => promptToClientMap.set(prompt.name, connectedClient));
          }
      } catch (error: any) {
           if (!(error?.name === 'McpError' && error?.code === -32601)) {
