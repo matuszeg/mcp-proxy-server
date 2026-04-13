@@ -60,19 +60,12 @@ setInterval(() => {
   for (const [sessionId, session] of activeSessions.entries()) {
     if (now - session.lastActivity > SESSION_IDLE_TIMEOUT_MS) {
       logger.log(`Session ${sessionId} idle for >30 minutes, cleaning up.`);
-      session.server.close().catch((e: any) => logger.warn(`Error closing idle session ${sessionId}:`, e));
+      // Delete from maps first to prevent close handlers from re-firing
       activeSessions.delete(sessionId);
-      // Also clean up transports
-      if (sseTransports.has(sessionId)) {
-        const transport = sseTransports.get(sessionId)!;
-        transport.close?.().catch(() => {});
-        sseTransports.delete(sessionId);
-      }
-      if (streamableHttpTransports.has(sessionId)) {
-        const transport = streamableHttpTransports.get(sessionId)!;
-        transport.close?.().catch(() => {});
-        streamableHttpTransports.delete(sessionId);
-      }
+      sseTransports.delete(sessionId);
+      streamableHttpTransports.delete(sessionId);
+      // Then close the server (which closes the transport)
+      session.server.close().catch((e: any) => logger.warn(`Error closing idle session ${sessionId}:`, e));
     }
   }
   if (activeSessions.size > 0) {
@@ -646,26 +639,26 @@ app.get("/sse", async (req, res) => {
     const currentTransport = clientTransport; // To use in closures for onclose/onerror
     const currentSessionId = actualTransportSessionId; // To use in closures
 
-    currentTransport.onerror = (err: any) => {
-      logger.error(`[${clientId}] SSE transport error for session ${currentSessionId}: ${err?.stack || err?.message || err}`);
+    let sseSessionCleaned = false;
+    const cleanupSseSession = (reason: string) => {
+      if (sseSessionCleaned) return;
+      sseSessionCleaned = true;
+      logger.log(`[${clientId}] SSE session ${currentSessionId} ${reason}. Active sessions: ${activeSessions.size}`);
       sseTransports.delete(currentSessionId);
       const session = activeSessions.get(currentSessionId);
       if (session) {
         session.server.close().catch(() => {});
         activeSessions.delete(currentSessionId);
       }
-      logger.log(`[${clientId}] Session ${currentSessionId} removed due to error. Active sessions: ${activeSessions.size}`);
+    };
+
+    currentTransport.onerror = (err: any) => {
+      logger.error(`[${clientId}] SSE transport error for session ${currentSessionId}: ${err?.stack || err?.message || err}`);
+      cleanupSseSession('removed due to error');
     };
 
     currentTransport.onclose = () => {
-      logger.log(`[${clientId}] SSE client disconnected for session ${currentSessionId}.`);
-      sseTransports.delete(currentSessionId);
-      const session = activeSessions.get(currentSessionId);
-      if (session) {
-        session.server.close().catch(() => {});
-        activeSessions.delete(currentSessionId);
-      }
-      logger.log(`[${clientId}] Session ${currentSessionId} removed on close. Active sessions: ${activeSessions.size}`);
+      cleanupSseSession('closed');
     };
 
     logger.log(`[${clientId}] Creating new server instance and connecting transport for session ${currentSessionId}...`);
@@ -821,43 +814,33 @@ app.all("/mcp", async (req, res) => { // Changed to app.all to handle GET for SS
 
     const currentTransportForHandlers = httpTransport; // Use this specific instance in handlers
 
-    currentTransportForHandlers.onerror = (error: Error) => {
+    let httpSessionCleaned = false;
+    const cleanupHttpSession = (reason: string) => {
+      if (httpSessionCleaned) return;
+      httpSessionCleaned = true;
       const idToClean = currentTransportForHandlers.sessionId || transportSessionIdToUse;
-      logger.error(`[${clientId}] /mcp: StreamableHTTPServerTransport error for session related to ${idToClean}:`, error);
-
+      logger.log(`[${clientId}] /mcp: Session ${idToClean} ${reason}. Active sessions: ${activeSessions.size}`);
       if (streamableHttpTransports.get(tempGeneratedIdForEarlyMap) === currentTransportForHandlers) {
         streamableHttpTransports.delete(tempGeneratedIdForEarlyMap);
       }
       if (currentTransportForHandlers.sessionId && streamableHttpTransports.get(currentTransportForHandlers.sessionId) === currentTransportForHandlers) {
         streamableHttpTransports.delete(currentTransportForHandlers.sessionId);
       }
-      // Clean up managed session
       for (const id of [tempGeneratedIdForEarlyMap, currentTransportForHandlers.sessionId]) {
         if (id && activeSessions.has(id)) {
           activeSessions.get(id)!.server.close().catch(() => {});
           activeSessions.delete(id);
         }
       }
-      logger.log(`[${clientId}] /mcp: Session ${idToClean} removed due to error. Active sessions: ${activeSessions.size}`);
+    };
+
+    currentTransportForHandlers.onerror = (error: Error) => {
+      logger.error(`[${clientId}] /mcp: Transport error:`, error);
+      cleanupHttpSession('removed due to error');
     };
 
     currentTransportForHandlers.onclose = () => {
-      const idToClean = currentTransportForHandlers.sessionId || transportSessionIdToUse;
-      logger.log(`[${clientId}] /mcp: StreamableHTTPServerTransport closed for session related to ${idToClean}.`);
-      if (streamableHttpTransports.get(tempGeneratedIdForEarlyMap) === currentTransportForHandlers) {
-        streamableHttpTransports.delete(tempGeneratedIdForEarlyMap);
-      }
-      if (currentTransportForHandlers.sessionId && streamableHttpTransports.get(currentTransportForHandlers.sessionId) === currentTransportForHandlers) {
-        streamableHttpTransports.delete(currentTransportForHandlers.sessionId);
-      }
-      // Clean up managed session
-      for (const id of [tempGeneratedIdForEarlyMap, currentTransportForHandlers.sessionId]) {
-        if (id && activeSessions.has(id)) {
-          activeSessions.get(id)!.server.close().catch(() => {});
-          activeSessions.delete(id);
-        }
-      }
-      logger.log(`[${clientId}] /mcp: Session ${idToClean} removed on close. Active sessions: ${activeSessions.size}`);
+      cleanupHttpSession('closed');
     };
 
     try {
